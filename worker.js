@@ -2,8 +2,6 @@
 // Разверните этот файл как Cloudflare Worker.
 // Перед деплоем замените userID на свой собственный UUID.
 
-import { connect } from 'cloudflare:sockets';
-
 // Сгенерируйте свой UUID командой: 
 //   node -e "console.log(crypto.randomUUID())"
 // или на сайте uuidgenerator.net, и вставьте сюда:
@@ -14,13 +12,19 @@ export default {
     try {
       const upgradeHeader = request.headers.get('Upgrade');
       if (!upgradeHeader || upgradeHeader !== 'websocket') {
-        // Обычный HTTP-запрос — отдаём безобидную страницу,
-        // чтобы при проверке воркер выглядел как обычный сайт.
-        return new Response('OK', { status: 200 });
+        // Обычный HTTP-запрос — отдаём диагностическую страницу:
+        // пробуем загрузить cloudflare:sockets прямо тут, чтобы
+        // ошибка (если она есть) была видна в браузере.
+        try {
+          await import('cloudflare:sockets');
+          return new Response('OK: sockets module loaded fine', { status: 200 });
+        } catch (e) {
+          return new Response('DIAGNOSTIC ERROR loading cloudflare:sockets: ' + e.toString(), { status: 200 });
+        }
       }
       return await vlessOverWSHandler(request);
     } catch (err) {
-      return new Response(err.toString());
+      return new Response('FETCH ERROR: ' + err.toString() + '\n' + (err.stack || ''));
     }
   },
 };
@@ -186,15 +190,24 @@ async function handleTCPOutBound(
   vlessResponseHeader
 ) {
   async function connectAndWrite(address, port) {
+    const { connect } = await import('cloudflare:sockets');
     const tcpSocket = connect({ hostname: address, port });
     remoteSocket.value = tcpSocket;
     const writer = tcpSocket.writable.getWriter();
     await writer.write(rawClientData);
     writer.releaseLock();
+    console.log(`[connect] wrote initial data to ${address}:${port}`);
     return tcpSocket;
   }
 
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+  let tcpSocket;
+  try {
+    tcpSocket = await connectAndWrite(addressRemote, portRemote);
+  } catch (err) {
+    console.log(`[connect] FAILED ${addressRemote}:${portRemote} — ${err}`);
+    try { webSocket.close(1011, 'upstream connect failed'); } catch (e) {}
+    return;
+  }
 
   tcpSocket.readable
     .pipeTo(
@@ -213,7 +226,8 @@ async function handleTCPOutBound(
         },
       })
     )
-    .catch(() => {
+    .catch((err) => {
+      console.log(`[pipe] remote->client error: ${err}`);
       try { webSocket.close(); } catch (e) {}
     });
 }
